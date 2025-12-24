@@ -1,0 +1,1 @@
+pip install PySide6 opencv-python easyocr numpy pyinstaller
