@@ -1,24 +1,37 @@
-import sys, cv2, psycopg2
+import socket
+import sys
 from datetime import datetime, time
+
+import cv2
+import psycopg2
 from openpyxl import Workbook
 from openpyxl.styles import PatternFill
-from PySide6.QtWidgets import QGraphicsOpacityEffect
-from PySide6.QtCore import QPropertyAnimation
-from PySide6.QtCore import QPropertyAnimation, QEasingCurve
-
-
+from PySide6.QtCore import QDate, QRegularExpression, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QImage, QPixmap, QRegularExpressionValidator
 from PySide6.QtWidgets import (
-    QApplication, QWidget, QLabel, QPushButton,
-    QVBoxLayout, QHBoxLayout, QStackedWidget,
-    QLineEdit, QDialog, QFileDialog,
-    QTableWidget, QTableWidgetItem, QHeaderView,
-    QDateEdit, QComboBox, QGridLayout, QSizePolicy
+    QApplication,
+    QComboBox,
+    QDateEdit,
+    QDialog,
+    QFileDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSizePolicy,
+    QStackedWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtCore import Qt, QTimer, QDate, Signal, QRegularExpression
-from PySide6.QtGui import (
-    QPixmap, QImage, QColor,
-    QRegularExpressionValidator
-)
+#===================Helper Function============
+def clean_text(s):
+    if s is None:
+        return ""
+    return s.replace("\x00", "").strip()
 
 # ================= DB CONFIG =================
 DB = dict(
@@ -26,16 +39,93 @@ DB = dict(
     user="postgres",
     password="1234",
     host="localhost",
-    port=5432
+    port=5432,
 )
 TABLE = "camera_inspection"
+last_data=None
+# ================= SOCKET THREAD (ADDED) =================
+class FHVSocketThread(QThread):
+    data_received = Signal(str)
+    def __init__(self):
+        super().__init__()          #  REQUIRED
+        self.running = True         #  REQUIRED
+        self.waiting_for_user = False
+
+
+
+    def run(self):
+        HOST = "172.21.2.11"
+        PORT = 9876
+
+        while self.running:
+            try:
+                print("SOCKET LISTENING")
+                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind((HOST, PORT))
+                server.listen(1)
+
+                conn, _ = server.accept()
+                print("SOCKET CONNECTED")
+
+                while self.running:
+                    if self.waiting_for_user:
+                        self.msleep(100)
+                        continue
+
+                    conn.sendall(b"M\r\n")
+                    data = conn.recv(4096)
+
+                    if not data:
+                        raise ConnectionResetError("Camera closed connection")
+
+                    msg = data.decode("ascii", errors="ignore")
+                    msg = msg.replace("\x00", "").strip()
+
+                    if msg in ("ER", "OK", "0"):
+                        continue
+
+                    if len(msg) != 23 or not msg.isalnum():
+                        continue
+
+                    print("VALID SOCKET:", msg)
+
+                    self.waiting_for_user = True
+                    self.msleep(3000)  # 3s delay
+                    self.data_received.emit(msg)
+
+            except Exception as e:
+                print("SOCKET LOST → RECONNECTING:", e)
+                try:
+                    conn.close()
+                except:
+                    pass
+                self.msleep(2000)   # wait 2 sec and reconnect
+
+
+
+
+    def resume(self):
+        print("SOCKET RESUMED")
+        self.waiting_for_user = False
+
+    def stop(self):
+        self.running = False
+
+
+    def pause(self):
+        print("SOCKET PAUSED")
+        self.waiting_for_user = True
+
+
 
 
 # ================= DB INIT =================
 def init_db():
     conn = psycopg2.connect(**DB)
     cur = conn.cursor()
-    cur.execute(f"""
+    cur.execute(
+        f"""
         CREATE TABLE IF NOT EXISTS {TABLE} (
             id SERIAL PRIMARY KEY,
             employee_id TEXT,
@@ -48,7 +138,8 @@ def init_db():
             time TIMESTAMP,
             image BYTEA
         )
-    """)
+    """
+    )
     conn.commit()
     cur.close()
     conn.close()
@@ -58,16 +149,25 @@ def init_db():
 def save_record(data, status, img_bytes):
     conn = psycopg2.connect(**DB)
     cur = conn.cursor()
-    cur.execute(f"""
+    cur.execute(
+        f"""
         INSERT INTO {TABLE}
         (employee_id, work_order, charge_no, serial_no,
          part_no, unique_no, status, time, image)
         VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-    """, (
-        data["emp"], data["wo"], data["charge"],
-        data["serial"], data["part"], data["unique"],
-        status, datetime.now(), psycopg2.Binary(img_bytes)
-    ))
+    """,
+        (
+            data["emp"],
+            data["wo"],
+            data["charge"],
+            data["serial"],
+            data["part"],
+            data["unique"],
+            status,
+            datetime.now(),
+            psycopg2.Binary(img_bytes),
+        ),
+    )
     conn.commit()
     cur.close()
     conn.close()
@@ -96,43 +196,40 @@ def fetch_report(from_dt, to_dt, status):
     return rows
 
 
-
-
 def get_home_counts():
     conn = psycopg2.connect(**DB)
     cur = conn.cursor()
 
     # Total counts
-    cur.execute(f"""
+    cur.execute(
+        f"""
         SELECT
             COUNT(*) AS total,
             COUNT(*) FILTER (WHERE status='OK') AS ok_count,
             COUNT(*) FILTER (WHERE status='NOT_OK') AS not_ok_count
         FROM {TABLE}
-    """)
+    """
+    )
     total, ok_cnt, not_ok_cnt = cur.fetchone()
 
     # Today count
     today_start = datetime.combine(datetime.today().date(), time.min)
     today_end = datetime.combine(datetime.today().date(), time.max)
 
-    cur.execute(f"""
+    cur.execute(
+        f"""
         SELECT COUNT(*)
         FROM {TABLE}
         WHERE time BETWEEN %s AND %s
-    """, (today_start, today_end))
+    """,
+        (today_start, today_end),
+    )
     today_cnt = cur.fetchone()[0]
 
     cur.close()
     conn.close()
 
-    return (
-        total or 0,
-        ok_cnt or 0,
-        not_ok_cnt or 0,
-        today_cnt or 0
-    )
-
+    return (total or 0, ok_cnt or 0, not_ok_cnt or 0, today_cnt or 0)
 
 
 # ================= CONFIRM DIALOG =================
@@ -172,7 +269,8 @@ class Home(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.setStyleSheet("""
+        self.setStyleSheet(
+            """
         QWidget {
             background: #f4f6f9;
             font-family: Segoe UI;
@@ -180,7 +278,8 @@ class Home(QWidget):
         QLabel {
             color: #333;
         }
-        """)
+        """
+        )
 
         self.main = QVBoxLayout(self)
         self.main.setContentsMargins(30, 30, 30, 30)
@@ -231,7 +330,6 @@ class Home(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.refresh()   # 🔑 refresh every time Home opens
 
 
 # ================= OPERATOR =================
@@ -240,23 +338,23 @@ class Operator(QWidget):
     EMP_LEN = 10
     WO_LEN = 10
 
-
     def __init__(self):
         super().__init__()
 
         # ---- Dark UI, clean inputs ----
-        self.setStyleSheet("""
+        self.setStyleSheet(
+            """
         QWidget { background:#121212; }
         QLabel { color:#ddd; background:transparent; }
         QLineEdit {
             background:transparent;
-            color:white;
+            color:black;
             border:1px solid #555;
             padding:6px;
             font-size:13px;
         }
-        """)
-
+        """
+        )
 
         self.cap = None
         self.frame = None
@@ -273,6 +371,7 @@ class Operator(QWidget):
         top.addWidget(self.btn_refresh)
 
         # ---- Employee & Work Order ----
+
         self.emp = QLineEdit(placeholderText="Employee ID")
         self.wo = QLineEdit(placeholderText="Work Order")
 
@@ -288,27 +387,22 @@ class Operator(QWidget):
 
         self.emp.returnPressed.connect(self.emp_done)
         self.wo.returnPressed.connect(self.wo_done)
+        self.emp.hide()
+        self.wo.hide()
 
-        digit_validator = QRegularExpressionValidator(QRegularExpression(r"\d+"))
 
         # ---- 4 fields ----
         self.fields = {
             "charge": ("charge no", 14),
-            "serial": ("serial no", 3),
-            "part": ("part no", 8),
             "unique": ("unique no", 4),
+            "Vendor Code": ("Vendor code", 8),
+            "serial": ("serial no", 3),
         }
 
         self.inputs = {}
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(4)
-        def all_fields_valid(self):
-            for _, le, ln in self.inputs.values():
-                if len(le.text()) != ln:
-                    return False
-            return True
-
 
         col = 0
         for key, (label, ln) in self.fields.items():
@@ -317,9 +411,9 @@ class Operator(QWidget):
             lbl.setStyleSheet("font-size:11px;color:#ccc;")
 
             le = QLineEdit()
+
             le.setFixedWidth(160)
             le.setMaxLength(ln)
-            le.setValidator(digit_validator)
             le.setPlaceholderText(f"{ln} digits")
             le.textChanged.connect(lambda _, k=key: self.validate_field(k))
 
@@ -347,18 +441,53 @@ class Operator(QWidget):
         lay.addLayout(grid)
         lay.addWidget(self.preview)
 
+        def all_fields_valid(self):
+            for _, le, ln in self.inputs.values():
+                if len(le.text()) != ln:
+                    return False
+            return True
 
-    def showEvent(self, event):
-        super().showEvent(event)
 
-        # Always force focus when Operator screen is visible
-        self.emp.show()
-        self.wo.hide()
+    def try_capture(self):
+        print("ENTER PRESSED")
 
-        self.emp.clear()
-        self.wo.clear()
+        if self.frame is None:
+            print("❌ Camera frame not ready")
+            return
 
-        self.emp.setFocus(Qt.OtherFocusReason)
+        if not self.all_fields_valid():
+            print("❌ Fields invalid")
+            return
+
+        print("✅ CAPTURE TRIGGERED")
+        self.capture()
+
+
+
+
+
+    def on_socket_data(self, msg):
+        print("Socket accepted:", msg)
+
+        charge = msg[0:14]
+        unique = msg[14:21]
+        serial = msg[-5:-2]
+        vendor_code = "16099680"
+
+        self.inputs["charge"][1].setText(charge)
+        self.inputs["unique"][1].setText(unique)
+        self.inputs["serial"][1].setText(serial)
+        self.inputs["Vendor Code"][1].setText(vendor_code)
+
+        #  VERY IMPORTANT
+        self.inputs["serial"][1].setFocus()
+
+
+
+
+
+
+
 
 
     # ---------- FLOW ----------
@@ -371,16 +500,26 @@ class Operator(QWidget):
     def wo_done(self):
         if self.wo.text():
             self.wo.hide()
+
             for lbl, le, _ in self.inputs.values():
                 lbl.show()
                 le.show()
-            self.inputs["charge"][1].setFocus()
+
             self.start_camera()
+
+            if not hasattr(self, "socket_thread"):
+                self.socket_thread = FHVSocketThread()
+                self.socket_thread.data_received.connect(self.on_socket_data)
+                self.socket_thread.start()
+
+
 
     def validate_field(self, key):
         _, le, ln = self.inputs[key]
         if not le.text():
-            le.setStyleSheet("background:transparent;color:white;border:1px solid #555;")
+            le.setStyleSheet(
+                "background:transparent;color:white;border:1px solid #555;"
+            )
         elif len(le.text()) == ln:
             le.setStyleSheet("background:#1b5e20;color:white;border:1px solid #2ecc71;")
         else:
@@ -389,8 +528,11 @@ class Operator(QWidget):
     # ---------- CAMERA ----------
     def start_camera(self):
         if self.cap is None:
-            self.cap = cv2.VideoCapture(0)
-        self.timer.start(30)
+            self.cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+            if not self.cap.isOpened():
+                self.preview.setText("Camera not available")
+                return
+        self.timer.start(20)
 
     def stop_camera(self):
         self.timer.stop()
@@ -400,9 +542,13 @@ class Operator(QWidget):
         self.preview.setText("Camera OFF")
 
     def update_frame(self):
+        if not self.cap:
+            return
+
         ret, frame = self.cap.read()
         if not ret:
             return
+
         self.frame = frame
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
@@ -419,49 +565,92 @@ class Operator(QWidget):
 
         self.emp.show()
         self.wo.hide()
+        self.socket_waiting = False
+
 
         for lbl, le, _ in self.inputs.values():
             lbl.hide()
             le.hide()
             le.clear()
-            le.setStyleSheet("background:transparent;color:white;border:1px solid #555;")
+            le.setStyleSheet(
+                "background:transparent;color:white;border:1px solid #555;"
+            )
 
         self.emp.setFocus()
+
+    def all_fields_valid(self):
+        for _, le, ln in self.inputs.values():
+            if len(le.text()) != ln:
+                return False
+        return True
+
+
+
+
+    def on_enter(self):
+        # Called when Operator page is shown
+        if hasattr(self, "socket_thread"):
+            print("Operator screen → resume socket")
+            self.socket_thread.resume()
+
+    def on_leave(self):
+        # Called when Operator page is hidden
+        if hasattr(self, "socket_thread"):
+            print("Leaving Operator → pause socket")
+            self.socket_thread.pause()
+
+
+
+
 
     # ---------- CAPTURE ----------
     def keyPressEvent(self, e):
         if e.key() == Qt.Key_Return and self.frame is not None:
-            for _, le, ln in self.inputs.values():
-                if len(le.text()) != ln:
-                    return
+            if not self.all_fields_valid():
+                return
             self.capture()
 
+
+
+
+
+
+
+
+
     def capture(self):
-        _, buf = cv2.imencode(".jpg", self.frame)
-        img_bytes = buf.tobytes()
+            _, buf = cv2.imencode(".jpg", self.frame)
+            img_bytes = buf.tobytes()
 
-        data = {
-            "emp": self.emp.text(),
-            "wo": self.wo.text(),
-            "charge": self.inputs["charge"][1].text(),
-            "serial": self.inputs["serial"][1].text(),
-            "part": self.inputs["part"][1].text(),
-            "unique": self.inputs["unique"][1].text(),
-        }
+            #  CLEAN *EVERY* FIELD BEFORE DB
+            data = {
+                "emp": clean_text(self.emp.text()),
+                "wo": clean_text(self.wo.text()),
+                "charge": clean_text(self.inputs["charge"][1].text()),
+                "serial": clean_text(self.inputs["serial"][1].text()),
+                "part": clean_text(self.inputs["Vendor Code"][1].text()),
+                "unique": clean_text(self.inputs["unique"][1].text()),
+            }
 
-        pix = QPixmap.fromImage(QImage.fromData(img_bytes))
-        dlg = ConfirmDialog(pix)
+            pix = QPixmap.fromImage(QImage.fromData(img_bytes))
+            dlg = ConfirmDialog(pix)
 
-        def after_save(res):
-            save_record(data, res, img_bytes)
-            for _, le, _ in self.inputs.values():
-                le.clear()
-                le.setStyleSheet("background:transparent;color:white;border:1px solid #555;")
-            self.inputs["charge"][1].setFocus()
-            self.record_saved.emit()
+            def after_save(res):
+                save_record(data, res, img_bytes)
 
-        dlg.decision.connect(after_save)
-        dlg.exec()
+                for _, le, _ in self.inputs.values():
+                    le.clear()
+
+                if hasattr(self, "socket_thread"):
+                    self.socket_thread.resume()
+
+                self.record_saved.emit()
+
+            dlg.decision.connect(after_save)
+            dlg.exec()
+
+
+
 
 
 # ================= REPORT =================
@@ -497,11 +686,20 @@ class Report(QWidget):
         main.addLayout(header)
 
         self.table = QTableWidget(0, 10)
-        self.table.setHorizontalHeaderLabels([
-            "Employee ID", "Work Order", "Charge No",
-            "Serial No", "Part No", "Unique No",
-            "Image", "Status", "Date", "Time"
-        ])
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Employee ID",
+                "Work Order",
+                "Charge No",
+                "Serial No",
+                "Vendor Code",
+                "Batch No",
+                "Image",
+                "Status",
+                "Date",
+                "Time",
+            ]
+        )
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
         main.addWidget(self.table)
@@ -510,63 +708,62 @@ class Report(QWidget):
         self.to_dt.dateChanged.connect(self.load)
         self.status.currentIndexChanged.connect(self.load)
         self.btn_excel.clicked.connect(self.export_excel)
-        self.enable_smooth_scroll()
-
 
         self.load()
 
-
-
-    def enable_smooth_scroll(self):
-        scroll = self.table.verticalScrollBar()
-
-        self._scroll_anim = QPropertyAnimation(scroll, b"value", self)
-        self._scroll_anim.setDuration(200)
-        self._scroll_anim.setEasingCurve(QEasingCurve.OutCubic)
-
-        def on_wheel(event):
-            delta = event.angleDelta().y()
-            step = scroll.singleStep() * 6
-
-            target = scroll.value() - step if delta > 0 else scroll.value() + step
-            target = max(scroll.minimum(), min(scroll.maximum(), target))
-
-            self._scroll_anim.stop()
-            self._scroll_anim.setStartValue(scroll.value())
-            self._scroll_anim.setEndValue(target)
-            self._scroll_anim.start()
-
-            event.accept()
-
-        self.table.wheelEvent = on_wheel
-
-
     def load(self):
+        self.table.setRowCount(0)  # clear table first
+
         f = datetime.combine(self.from_dt.date().toPython(), time.min)
         t = datetime.combine(self.to_dt.date().toPython(), time.max)
         rows = fetch_report(f, t, self.status.currentText())
 
-        self.table.setRowCount(0)
         for r in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
             self.table.setRowHeight(row, 160)
 
+            # Only add text first
             for c in range(6):
-                self.table.setItem(row, c, QTableWidgetItem(str(r[c])))
-
-            pix = QPixmap()
-            pix.loadFromData(bytes(r[6]))
-            lbl = QLabel(alignment=Qt.AlignCenter)
-            lbl.setPixmap(pix.scaled(240, 140, Qt.KeepAspectRatio))
-            self.table.setCellWidget(row, 6, lbl)
+                item = QTableWidgetItem(str(r[c]))
+                item.setTextAlignment(Qt.AlignCenter)
+                self.table.setItem(row, c, item)
 
             st = QTableWidgetItem(r[7])
+            st.setTextAlignment(Qt.AlignCenter)
             st.setForeground(QColor("green") if r[7] == "OK" else QColor("red"))
             self.table.setItem(row, 7, st)
 
-            self.table.setItem(row, 8, QTableWidgetItem(r[8].strftime("%Y-%m-%d")))
-            self.table.setItem(row, 9, QTableWidgetItem(r[8].strftime("%H:%M:%S")))
+            d = QTableWidgetItem(r[8].strftime("%Y-%m-%d"))
+            t = QTableWidgetItem(r[8].strftime("%H:%M:%S"))
+
+            d.setTextAlignment(Qt.AlignCenter)
+            t.setTextAlignment(Qt.AlignCenter)
+
+            self.table.setItem(row, 8, d)
+            self.table.setItem(row, 9, t)
+
+            self.table.horizontalHeader().setStyleSheet(
+                """
+                                                                QHeaderView::section {
+                                                                    background-color: #1e88e5;
+                                                                    color: white;
+                                                                    font-weight: bold;
+                                                                    padding: 6px;
+                                                                    border: none;
+                                                                }
+                                                                """
+            )
+
+            # Load image asynchronously after small delay
+            QTimer.singleShot(10, lambda row=row, img=r[6]: self._set_image(row, img))
+
+    def _set_image(self, row, img_bytes):
+        pix = QPixmap()
+        pix.loadFromData(bytes(img_bytes))
+        lbl = QLabel(alignment=Qt.AlignCenter)
+        lbl.setPixmap(pix.scaled(240, 140, Qt.KeepAspectRatio))
+        self.table.setCellWidget(row, 6, lbl)
 
     def export_excel(self):
         path, _ = QFileDialog.getSaveFileName(self, "Save Excel", "", "Excel (*.xlsx)")
@@ -575,11 +772,19 @@ class Report(QWidget):
 
         wb = Workbook()
         ws = wb.active
-        ws.append([
-            "Employee ID", "Work Order", "Charge No",
-            "Serial No", "Part No", "Unique No",
-            "Status", "Date", "Time"
-        ])
+        ws.append(
+            [
+                "Employee ID",
+                "Work Order",
+                "Charge No",
+                "Serial No",
+                "Part No",
+                "Unique No",
+                "Status",
+                "Date",
+                "Time",
+            ]
+        )
 
         green = PatternFill("solid", fgColor="C6EFCE")
         red = PatternFill("solid", fgColor="FFC7CE")
@@ -587,14 +792,23 @@ class Report(QWidget):
         rows = fetch_report(
             datetime.combine(self.from_dt.date().toPython(), time.min),
             datetime.combine(self.to_dt.date().toPython(), time.max),
-            self.status.currentText()
+            self.status.currentText(),
         )
 
         for r in rows:
-            ws.append([
-                r[0], r[1], r[2], r[3], r[4], r[5],
-                r[7], r[8].strftime("%Y-%m-%d"), r[8].strftime("%H:%M:%S")
-            ])
+            ws.append(
+                [
+                    r[0],
+                    r[1],
+                    r[2],
+                    r[3],
+                    r[4],
+                    r[5],
+                    r[7],
+                    r[8].strftime("%Y-%m-%d"),
+                    r[8].strftime("%H:%M:%S"),
+                ]
+            )
             ws[f"G{ws.max_row}"].fill = green if r[7] == "OK" else red
 
         wb.save(path)
@@ -607,7 +821,6 @@ class Main(QWidget):
         self.setWindowTitle("Camera Inspection System")
         self.resize(1600, 900)
 
-        # ---- Navigation bar ----
         nav = QHBoxLayout()
         self.stack = QStackedWidget()
 
@@ -616,58 +829,52 @@ class Main(QWidget):
         self.operator = Operator()
         self.report = Report()
 
+        # ---- Add pages to stack (CRITICAL) ----
+        self.stack.addWidget(self.home)
+        self.stack.addWidget(self.operator)
+        self.stack.addWidget(self.report)
+
+        # ---- Navigation buttons (NO UI change) ----
+        btn_home = QPushButton("Home")
+        btn_operator = QPushButton("Operator")
+        btn_report = QPushButton("Report")
+
+        btn_home.clicked.connect(self.go_home)
+        btn_operator.clicked.connect(self.go_operator)
+        btn_report.clicked.connect(self.go_report)
+
+
+        nav.addWidget(btn_home)
+        nav.addWidget(btn_operator)
+        nav.addWidget(btn_report)
+        nav.addStretch()
+
         # ---- Refresh connections ----
         self.operator.record_saved.connect(self.report.load)
         self.operator.record_saved.connect(self.home.refresh)
 
-        pages = {
-            "Home": self.home,
-            "Operator": self.operator,
-            "Report": self.report
-        }
-
-        for name, widget in pages.items():
-            btn = QPushButton(name)
-            btn.setStyleSheet("padding:8px 18px;font-weight:bold;")
-            btn.clicked.connect(self._make_nav_handler(widget))
-            nav.addWidget(btn)
-            self.stack.addWidget(widget)
-
-        nav.addStretch()
-
-        # ---- Main layout ----
+        # ---- Layout ----
         lay = QVBoxLayout(self)
         lay.addLayout(nav)
         lay.addWidget(self.stack)
 
         # ---- Default page ----
         self.stack.setCurrentWidget(self.home)
-        self.animate_page(self.home)
 
-    # =============================
-    # NAVIGATION HANDLER
-    # =============================
-    def _make_nav_handler(self, widget):
-        def handler():
-            self.stack.setCurrentWidget(widget)
-            self.animate_page(widget)
-        return handler
 
-    # =============================
-    # FADE-IN ANIMATION
-    # =============================
-    def animate_page(self, widget):
-        effect = QGraphicsOpacityEffect(widget)
-        widget.setGraphicsEffect(effect)
 
-        anim = QPropertyAnimation(effect, b"opacity", widget)
-        anim.setDuration(250)     # animation speed (ms)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
+    def go_home(self):
+            self.operator.on_leave()
+            self.stack.setCurrentWidget(self.home)
 
-        # keep reference (avoid GC)
-        widget._fade_anim = anim
-        anim.start()
+    def go_operator(self):
+            self.stack.setCurrentWidget(self.operator)
+            self.operator.on_enter()
+
+    def go_report(self):
+            self.operator.on_leave()
+            self.stack.setCurrentWidget(self.report)
+
 
 
 
