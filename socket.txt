@@ -1,0 +1,44 @@
+
+
+import socket
+import time
+
+HOST = "172.21.2.11"
+PORT = 9876
+
+server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind((HOST, PORT))
+server.listen(1)
+
+print("FHV SERVER LISTENING")
+
+conn, addr = server.accept()
+print("FHV CONNECTED:", addr)
+
+while True:
+    #  1. TRIGGER MEASURE (same as clicking button)
+    conn.sendall(b"M\r\n")
+    print("MEASURE COMMAND SENT")
+
+    #  2. RECEIVE RESPONSES
+    while True:
+        data = conn.recv(4096)
+        if not data:
+            break
+
+        msg = data.decode("ascii", errors="ignore").strip()
+        print("RAW:", msg)
+
+        # Ignore protocol chatter
+        if msg in ("ER", "OK"):
+            continue
+
+        #  THIS IS YOUR REAL DATA
+        print("MEASURE RESULT:", msg)
+
+        # ACK result
+        conn.sendall(b"M\r\n")
+        break
+
+    time.sleep(1)   
